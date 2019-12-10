@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import time
 
+from sklearn import metrics
+from scipy.stats import pearsonr
+
 # Classes and functions for data extraction
 class CellLine(object):
     """Basic, parent class representing cell line regradless of data source"""
