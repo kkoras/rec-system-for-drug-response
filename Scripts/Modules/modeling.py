@@ -228,3 +228,120 @@ class Dataset:
                 std = dataframe.std(axis=0)
                 return (dataframe - mean) / std
         
+class Model:
+    def __init__(self, name, network):
+        self.name = name
+        self.network = network
+        
+    def train(self, train_samples, cell_line_features, drug_features,
+             batch_size, optimizer, criterion, reg_lambda=0, log=True):
+        """Perform training process by looping over training set in batches (one epoch) of the
+        training."""
+        no_batches = train_samples.shape[0] // batch_size + 1
+        
+        # Training the model
+        self.network.train()
+        for batch in range(no_batches):
+            # Separate response variable batch
+            if batch != no_batches:
+                samples_batch = train_samples.iloc[batch * batch_size:(batch + 1) * batch_size]
+            else:
+                samples_batch = train_samples.iloc[batch * batch_size:]
+
+            # Extract output variable batch
+            y_batch = torch.from_numpy(samples_batch["AUC"].values).view(-1, 1)
+
+            # Extract cell lines IDs for which data shall be extracted
+            cl_ids = samples_batch["COSMIC_ID"].values
+            # Extract corresponding cell line data
+            cell_line_input_batch = cell_line_features.loc[cl_ids].values
+            cell_line_input_batch = torch.from_numpy(cell_line_input_batch)
+
+            # Extract drug IDs for which data shall be extracted
+            drug_ids = samples_batch["DRUG_ID"].values
+            # Extract corresponding drug data
+            drug_input_batch = drug_features.loc[drug_ids].values
+            drug_input_batch = torch.from_numpy(drug_input_batch)
+
+            # Clear gradient buffers because we don't want to accummulate gradients 
+            optimizer.zero_grad()
+
+            # Perform forward pass
+            batch_output = self.network(drug_input_batch.float(), cell_line_input_batch.float())
+
+            reg_sum = 0
+            for param in self.network.parameters():
+                reg_sum += 0.5 * (param ** 2).sum()  # L2 norm
+
+            # Compute the loss for this batch
+            loss = criterion(batch_output, y_batch.float()) + reg_lambda * reg_sum
+            # Get the gradients w.r.t. the parameters
+            loss.backward()
+            # Update the parameters
+            optimizer.step()
+        return loss
+    
+    def predict(self, samples, cell_line_features, drug_features):
+        """Predict response on a given set of samples"""
+        y_true = samples["AUC"].values
+
+        cl_input = cell_line_features.loc[samples["COSMIC_ID"].values].values
+        drug_input = drug_features.loc[samples["DRUG_ID"].values].values
+
+        self.network.eval()
+        with torch.no_grad():
+            predicted = self.network(torch.from_numpy(drug_input).float(), 
+                             torch.from_numpy(cl_input).float())
+        return predicted, y_true
+    
+    @staticmethod
+    def per_drug_performance_df(samples, predicted, mean_training_auc=None):
+        """Compute evaluation metrics per drug and return them in a DataFrame"""
+        sample_with_predictions = samples.copy()
+        sample_with_predictions["Predicted AUC"] = predicted.numpy()
+
+        drugs = []
+        model_corrs = []
+        model_rmses = []
+        dummy_corrs = []
+        dummy_rmses = []
+        no_samples = []
+
+        for drug in sample_with_predictions.DRUG_ID.unique():
+            df = sample_with_predictions[sample_with_predictions.DRUG_ID == drug]
+            if df.shape[0] < 2:
+                continue
+            if mean_training_auc:
+                dummy_preds = [mean_training_auc] * df.shape[0]
+            else:
+                dummy_preds = [df["AUC"].mean()] * df.shape[0]
+            dummy_rmse = metrics.mean_squared_error(df["AUC"], dummy_preds) ** 0.5
+            dummy_corr = pearsonr(df["AUC"], dummy_preds)
+
+            model_rmse = metrics.mean_squared_error(df["AUC"], df["Predicted AUC"]) ** 0.5
+            model_corr = pearsonr(df["AUC"], df["Predicted AUC"])
+
+            drugs.append(drug)
+            dummy_rmses.append(dummy_rmse)
+            dummy_corrs.append(dummy_corr[0])
+
+            model_rmses.append(model_rmse)
+            model_corrs.append(model_corr[0])
+
+            no_samples.append(df.COSMIC_ID.nunique())
+
+        performance_per_drug = pd.DataFrame()
+        performance_per_drug["Drug ID"] = drugs
+        performance_per_drug["Model RMSE"] = model_rmses
+        performance_per_drug["Model correlation"] = model_corrs
+
+        performance_per_drug["Dummy RMSE"] = dummy_rmses
+        performance_per_drug["Dummy correlation"] = dummy_corrs
+        performance_per_drug["No. samples"] = no_samples
+
+        return performance_per_drug
+        
+    @staticmethod
+    def evaluate_predictions(y_true, preds):
+        """Compute RMSE and correlation with true values for model predictions"""
+        return metrics.mean_squared_error(y_true, preds) ** 0.5, pearsonr(y_true, preds)
