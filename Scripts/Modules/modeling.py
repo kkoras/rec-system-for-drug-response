@@ -3,9 +3,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import time
+import json
+import os
 
 from sklearn import metrics
 from scipy.stats import pearsonr
+
+import torch
+from torch.autograd import Variable
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
 
 # Classes and functions for data extraction
 class CellLine(object):
@@ -227,6 +234,187 @@ class Dataset:
                 mean = dataframe.mean(axis=0)
                 std = dataframe.std(axis=0)
                 return (dataframe - mean) / std
+            
+    @staticmethod
+    def samples_train_test_split(samples, num_cell_lines_val, num_cell_lines_test, seed=None,
+                                shuffle=True):
+        # Fix the seed for pandas and numpy shuffling to get reproducible results
+        np.random.seed(seed)
+        # Shuffle all the samples if desired
+        if shuffle:
+             samples = samples.sample(frac=1.)
+    
+        # Extract test cell lines samples
+        cell_lines_test = list(np.random.choice(samples.COSMIC_ID.unique(), size=num_cell_lines_test,
+                                               replace=False))
+        samples_test = samples[samples.COSMIC_ID.isin(cell_lines_test)]
+
+        # Extract rest
+        rest = samples[~samples.COSMIC_ID.isin(cell_lines_test)]
+
+        # Extract validation cell lines samples
+        cell_lines_val = list(np.random.choice(rest.COSMIC_ID.unique(), size=num_cell_lines_val,
+                                               replace=False))
+        samples_val = rest[rest.COSMIC_ID.isin(cell_lines_val)]
+
+        # Extract rest (training set)
+        samples_train = rest[~rest.COSMIC_ID.isin(cell_lines_val)]
+        
+        return samples_train, samples_val, samples_test, cell_lines_test, cell_lines_val
+        
+class Results:
+    def __init__(self, directory):
+        self.directory = directory
+        
+    def get_analysis_results(self, experiment):
+        """Get a table with results corresponding to the last epoch of training for every
+        trial."""
+        exp_dir = os.path.join(self.directory, "Experiment " + str(experiment))
+        df = pd.read_csv(os.path.join(exp_dir, "analysis_tuning_results.csv"))
+        return df
+    
+    def get_per_trial_results(self, experiment, trial, result_type="progress"):
+        trial_dir = os.path.join(self.directory, "Experiment " + str(experiment), trial)
+        with open(os.path.join(trial_dir, "params.json"), "r") as f:
+            params = json.load(f)
+        if result_type == "progress":
+            df = pd.read_csv(os.path.join(trial_dir, "progress.csv"))
+        elif result_type == "per_drug_train":
+            df = pd.read_csv(os.path.join(trial_dir, "performance_per_drug_train.csv"))
+        else:
+            df = pd.read_csv(os.path.join(trial_dir, "performance_per_drug_val.csv"))
+        return df, params
+        
+
+    def get_best_params(self, experiment):
+        """Get best params per experiment. If experiment is "all", display best params for all 
+        experiments."""
+        if experiment == "all":
+            for experiment in os.listdir(self.directory):
+                exp_dir = os.path.join(self.directory, experiment)
+                if os.path.isdir(exp_dir):
+                    best_config_dir = os.path.join(exp_dir, "best_config.txt")
+                    # Display best config for this experiment
+                    print(experiment)
+                    with open(best_config_dir, "r") as f:
+                        print(f.read())
+                    print()
+        else:
+            exp_dir = os.path.join(self.directory, "Experiment " + str(experiment))
+            best_config_dir = os.path.join(exp_dir, "best_config.txt")
+            # Display best config for this experiment
+            with open(best_config_dir, "r") as f:
+                print(f.read())
+                
+    def get_best_model_learning_curve(self, experiment):
+        """Get results achieved for a best model in a given experiment and epochs"""
+        exp_dir = os.path.join(self.directory, "Experiment " + str(experiment))
+        best_model_learning_curve_df = pd.read_csv(os.path.join(exp_dir, "best_model_test_results.csv")) 
+        return best_model_learning_curve_df
+    
+    def get_averaged_best_model_learning_curve(self):
+        """Get results achieved by best models, averaged over experiments"""
+        pass
+        
+    def get_best_model_best_result(self, experiment, metric, mode="max"):
+        """Get best result of a given metric achieved by best model of the experiment.
+        If experiment == "all", display average of the best metrics across experiments."""
+        
+        if experiment == "all":
+            metrics = []
+            for experiment in os.listdir(self.directory):
+                exp_dir = os.path.join(self.directory, experiment)
+                if os.path.isdir(exp_dir):
+                    learning_curve = self.get_best_model_learning_curve(int(experiment[-1]))
+                    if mode == "max":
+                        metrics.append(learning_curve[metric].max())
+                    else:
+                        metrics.append(learning_curve[metric].min())
+            return metrics
+        
+        # Get best model's learning curve
+        learning_curve = self.get_best_model_learning_curve(experiment)
+        if mode == "max":
+            return learning_curve[metric].max()
+        else:
+            return learning_curve[metric].min()
+        
+    def get_best_model_per_drug_results(self, exp, mode="test"):
+        """Get DataFrame with best model's test or train per drug results. If exp is "all",
+        get a results from all experiment where rows are also flagged by experiment name."""
+        if exp != "all":
+            exp_dir = os.path.join(self.directory, "Experiment " + str(exp))
+            df = pd.read_csv(os.path.join(exp_dir, "best_model_per_drug_" + mode + "_results.csv"))
+            return df
+        else:
+            dfs = []
+            for experiment in os.listdir(self.directory):
+                exp_dir = os.path.join(self.directory, experiment)
+                if os.path.isdir(exp_dir):
+                    df = pd.read_csv(os.path.join(exp_dir, "best_model_per_drug_" + mode + "_results.csv"))
+                    df["Experiment"] = [int(experiment[-1])] * df.shape[0]
+                    dfs.append(df)
+            return pd.concat(dfs, axis=0)
+            
+    
+    def find_trial_with_params(self, exp, params_comb):
+        """Find trials (folder names) which contain specified parameters combination."""
+        exp_dir = os.path.join(self.directory, "Experiment " + str(exp))
+        matching_trials = []
+        for trial in os.listdir(exp_dir):
+            trial_dir = os.path.join(exp_dir, trial)
+            if os.path.isdir(trial_dir):
+                with open(os.path.join(trial_dir, "params.json"), "r") as f:
+                    trial_params = json.load(f)
+                combination_in_trial = True   # Flag determining if given combination is present
+                                              # in current trial
+                for param in param_comb:
+                    if param_comb[param] != trial_params[param]:
+                        combination_in_trial = False
+                if combination_in_trial:
+                    matching_trials.append(trial)
+        return matching_trials
+    
+    def get_averaged_metric_per_param_comb(self, params_comb, metric, results_type, mode):
+        """Get a list of all param combinations satysfying provided combination and return
+        an averaged metric over all experiments for every combination"""
+        exp_dict = {}
+        for exp in range(1, 6):
+            matching_trials = self.find_trial_with_params(exp, param_comb)
+            trial_dict = {}
+            for trial in matching_trials:
+                df, params = self.get_per_trial_results(exp, trial, results_type)
+
+                param_names_to_drop = ["out_activation", "autoencoders_activ_func", "batch_size",
+                                      "cell_line_hidden_dim1", "cell_line_hidden_dim2", 
+                                      "drug_hidden_dim1", "drug_hidden_dim2", "epochs", "criterion",
+                                      "code_dim"]
+                for name in param_names_to_drop:
+                    if name in params:
+                        del params[name]
+                if mode == "max":
+                    best_metric = df[metric].max()
+                else:
+                    best_metric = df[metric].min()
+                trial_dict[str(params)] = best_metric
+            exp_dict[exp] = trial_dict
+        res = {}
+        for trial in exp_dict[1]:
+            metrics = []
+            for exp in exp_dict:
+                metrics.append(exp_dict[exp][trial])
+            res[trial] = metrics
+        return res
+                
+    @staticmethod
+    def plot_learning_curve(df, metric1, metric2=None, title="", ylabel=""):
+        plt.title(title)
+        plt.xlabel("Epochs")
+        plt.ylabel("")
+        sns.lineplot(range(1, df.shape[0] + 1), df[metric1], label=metric1)
+        if metric2:
+            sns.lineplot(range(1, df.shape[0] + 1), df[metric2], label=metric2)
+        plt.legend()
         
 class Model:
     def __init__(self, name, network):
@@ -318,8 +506,11 @@ class Model:
             dummy_rmse = metrics.mean_squared_error(df["AUC"], dummy_preds) ** 0.5
             dummy_corr = pearsonr(df["AUC"], dummy_preds)
 
-            model_rmse = metrics.mean_squared_error(df["AUC"], df["Predicted AUC"]) ** 0.5
-            model_corr = pearsonr(df["AUC"], df["Predicted AUC"])
+            try:
+                model_rmse = metrics.mean_squared_error(df["AUC"], df["Predicted AUC"]) ** 0.5
+                model_corr = pearsonr(df["AUC"], df["Predicted AUC"])
+            except ValueError:
+                model_rmse, model_corr = np.nan, (np.nan, np.nan)
 
             drugs.append(drug)
             dummy_rmses.append(dummy_rmse)
@@ -345,3 +536,82 @@ class Model:
     def evaluate_predictions(y_true, preds):
         """Compute RMSE and correlation with true values for model predictions"""
         return metrics.mean_squared_error(y_true, preds) ** 0.5, pearsonr(y_true, preds)
+    
+class ModelWithAutoencoders(Model):
+    def train(self, train_samples, cell_line_features, drug_features,
+             batch_size, optimizer, criterion, reconstruction_term_drug=0.0,
+              reconstruction_term_cl=0.0, reg_lambda=0.0, log=True):
+        """Perform training process by looping over training set in batches (one epoch) of the
+        training."""
+        no_batches = train_samples.shape[0] // batch_size + 1
+        # Establish the device
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        if log:
+          print(device)
+        # Move the network into device
+        self.network.to(device)
+        # Training the model
+        self.network.train()
+        for batch in range(no_batches):
+            # Separate response variable batch
+            if batch != no_batches:
+                samples_batch = train_samples.iloc[batch * batch_size:(batch + 1) * batch_size]
+            else:
+                samples_batch = train_samples.iloc[batch * batch_size:]
+
+            # Extract output variable batch
+            y_batch = torch.from_numpy(samples_batch["AUC"].values).view(-1, 1).to(device)
+
+            # Extract cell lines IDs for which data shall be extracted
+            cl_ids = samples_batch["COSMIC_ID"].values
+            # Extract corresponding cell line data
+            cell_line_input_batch = cell_line_features.loc[cl_ids].values
+            cell_line_input_batch = torch.from_numpy(cell_line_input_batch).to(device)
+
+            # Extract drug IDs for which data shall be extracted
+            drug_ids = samples_batch["DRUG_ID"].values
+            # Extract corresponding drug data
+            drug_input_batch = drug_features.loc[drug_ids].values
+            drug_input_batch = torch.from_numpy(drug_input_batch).to(device)
+
+            # Clear gradient buffers because we don't want to accummulate gradients 
+            optimizer.zero_grad()
+
+            # Perform forward pass
+            batch_output, batch_drug_reconstruction, batch_cl_reconstruction = self.network(
+                drug_input_batch.float(), cell_line_input_batch.float())
+
+            reg_sum = 0
+            for param in self.network.parameters():
+                reg_sum += 0.5 * (param ** 2).sum()  # L2 norm
+
+            # Compute the loss for this batch
+            output_loss = criterion(batch_output, y_batch.float()) + reg_lambda * reg_sum
+            drug_recounstruction_loss = criterion(batch_drug_reconstruction, drug_input_batch.float())
+            cl_reconstruction_loss = criterion(batch_cl_reconstruction, cell_line_input_batch.float())
+
+            # Sum the losses in the final cost function
+            loss = output_loss + reconstruction_term_drug * drug_recounstruction_loss + reconstruction_term_cl * cl_reconstruction_loss
+            # Get the gradients w.r.t. the parameters
+            loss.backward()
+            # Update the parameters
+            optimizer.step()
+            
+        return loss, drug_recounstruction_loss, cl_reconstruction_loss
+    
+    def predict(self, samples, cell_line_features, drug_features):
+        """Predict response on a given set of samples"""
+        # Establish the device
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        y_true = samples["AUC"].values
+
+        cl_input = cell_line_features.loc[samples["COSMIC_ID"].values].values
+        drug_input = drug_features.loc[samples["DRUG_ID"].values].values
+
+        self.network.eval()
+        with torch.no_grad():
+            predicted = self.network(torch.from_numpy(drug_input).to(device).float(), 
+                             torch.from_numpy(cl_input).to(device).float())
+        return predicted, y_true, drug_input, cl_input
+    
