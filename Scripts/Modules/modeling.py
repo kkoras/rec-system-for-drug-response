@@ -331,9 +331,44 @@ class Results:
         best_model_learning_curve_df = pd.read_csv(os.path.join(exp_dir, "best_model_test_results.csv")) 
         return best_model_learning_curve_df
     
-    def get_averaged_best_model_learning_curve(self):
-        """Get results achieved by best models, averaged over experiments"""
-        pass
+    def get_best_model_per_cell_line_results(self, experiment, mode="test"):
+        exp_dir = os.path.join(self.directory, "Experiment " + str(experiment))
+        best_model_per_cl_df = pd.read_csv(os.path.join(exp_dir, "best_model_per_cell_line_test_results.csv")) 
+        return best_model_per_cl_df
+    
+    def get_per_cell_line_results(self, experiment, metric, func="median", mode="test"):
+        if experiment == "all":
+            metrics = []
+            for experiment in os.listdir(self.directory):
+                exp_dir = os.path.join(self.directory, experiment)
+                if os.path.isdir(exp_dir):
+                    df = self.get_best_model_per_cell_line_results(int(experiment[-1]), mode=mode)
+                    if func == "median":
+                        val = df[metric].median()
+                    else:
+                        val = func(df[metric])
+                    metrics.append(val)
+            return metrics
+        # Get best model's learning curve
+        df = self.get_best_model_per_cell_line_results(experiment, mode=mode)
+        if func == "median":
+            return df[metric].median()
+        else:
+            return func(df[metric])
+    
+    def get_best_model_last_results(self, experiment, metric):
+        """Get results achieved in the last epoch by best model."""
+        if experiment == "all":
+            metrics = []
+            for experiment in os.listdir(self.directory):
+                exp_dir = os.path.join(self.directory, experiment)
+                if os.path.isdir(exp_dir):
+                    learning_curve = self.get_best_model_learning_curve(int(experiment[-1]))
+                    metrics.append(learning_curve.iloc[-1][metric])
+            return metrics
+        # Get best model's learning curve
+        learning_curve = self.get_best_model_learning_curve(experiment)
+        return learning_curve.iloc[-1][metric]
         
     def get_best_model_best_result(self, experiment, metric, mode="max"):
         """Get best result of a given metric achieved by best model of the experiment.
@@ -704,7 +739,7 @@ class Model:
             no_samples.append(df.shape[0])
 
         performance_per_entity = pd.DataFrame()
-        performance_per_entity["Drug ID"] = entities
+        performance_per_entity[entity_type] = entities
         performance_per_entity["Model RMSE"] = model_rmses
         performance_per_entity["Model correlation"] = model_corrs
 
@@ -1238,3 +1273,5 @@ class EarlyStopping:
         torch.save(model.state_dict(), 'checkpoint.pt')
         self.val_loss_min = val_loss
     
+    
+# ELo ELo
