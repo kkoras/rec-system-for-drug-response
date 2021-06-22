@@ -211,7 +211,7 @@ class Dataset:
         
     def set_response_data(self, dataframe, response_metric="AUC"):
         """Set data with response for cell line-drug pairs""" 
-        self.response_metric = "AUC"
+        self.response_metric = response_metric
         self.response_data = dataframe
         
     @staticmethod
@@ -265,21 +265,53 @@ class Dataset:
         samples_train = rest[~rest.COSMIC_ID.isin(cell_lines_val)]
         
         return samples_train, samples_val, samples_test, cell_lines_test, cell_lines_val
+        
+    @staticmethod
+    def samples_train_test_split_drugs(samples, num_drugs_val, num_drugs_test, seed=None,
+                                  shuffle=True):
+        # Fix the seed for pandas and numpy shuffling to get reproducible results
+        np.random.seed(seed)
+        # Shuffle all the samples if desired
+        if shuffle:
+              samples = samples.sample(frac=1.)
+        # Extract test drugs samples
+        drugs_test = list(np.random.choice(samples.DRUG_ID.unique(), size=num_drugs_test,
+                                                replace=False))
+        samples_test = samples[samples.DRUG_ID.isin(drugs_test)]
+        # Extract rest
+        rest = samples[~samples.DRUG_ID.isin(drugs_test)]
+    
+        # Extract validation drugs samples
+        drugs_val = list(np.random.choice(rest.DRUG_ID.unique(), size=num_drugs_val,
+                                                replace=False))
+        samples_val = rest[rest.DRUG_ID.isin(drugs_val)]
+    
+        # Extract rest (training set)
+        samples_train = rest[~rest.DRUG_ID.isin(drugs_val)]
+        
+        return samples_train, samples_val, samples_test, drugs_test, drugs_val
 
     @staticmethod
     def exclude_drugs(samples, drugs):
         """Exclude pairs involving particular set of drugs.
 
         Args:
-            samples (DataFrame): List of drug-cell line pairs and corresponding AUC.
+            samples (DataFrame): List of drug-cell line pairs and corresponding response metric.
             drugs (list): List of drug IDs to exclude.
         Returns:
-            df (DataFrame): List of drug-cell line pairs and corresponding AUC without
+            df (DataFrame): List of drug-cell line pairs and corresponding response metric without
                 given drugs.
 
         """
         df = samples[~samples["DRUG_ID"].isin(drugs)]
         return df
+    
+    @staticmethod
+    def min_max_series(s, minimum=None, maximum=None):
+        """Perform min-max scaling on a one-dimensional Series or array."""
+        if minimum and maximum:
+            return (s - minimum) / (maximum - minimum)
+        return (s - s.min()) / (s.max() - s.min())
         
 class Results:
     def __init__(self, directory):
@@ -534,11 +566,11 @@ class Model:
         self.network = network
         
     def train(self, train_samples, cell_line_features, drug_features,
-             batch_size, optimizer, criterion, reg_lambda=0, log=True):
+             batch_size, optimizer, criterion, reg_lambda=0, log=True, response_metric="AUC"):
         """Perform one epoch of training of the underlying network.
 
         Args:
-            train_samples (DataFrame): Table containing drug-cell line training pairs and corresponding AUC.
+            train_samples (DataFrame): Table containing drug-cell line training pairs and corresponding response metric.
             cell_line_features (DataFrame): Cell line features data.
             drug_features (DataFrame): Drug features data.
             batch_size (int): Batch size.
@@ -568,7 +600,7 @@ class Model:
                 samples_batch = train_samples.iloc[batch * batch_size:]
 
             # Extract output variable batch
-            y_batch = torch.from_numpy(samples_batch["AUC"].values).view(-1, 1).to(device)
+            y_batch = torch.from_numpy(samples_batch[response_metric].values).view(-1, 1).to(device)
 
             # Extract cell lines IDs for which data shall be extracted
             cl_ids = samples_batch["COSMIC_ID"].values
@@ -601,11 +633,11 @@ class Model:
             optimizer.step()
         return loss
     
-    def predict(self, samples, cell_line_features, drug_features):
+    def predict(self, samples, cell_line_features, drug_features, response_metric="AUC"):
         """Predict response for a given set of samples.
 
         Args:
-            samples (DataFrame): Table containing drug-cell line pairs and corresponding AUC.
+            samples (DataFrame): Table containing drug-cell line pairs and corresponding response metric.
             cell_line_features (DataFrame): Cell line features data.
             drug_features (DataFrame): Drug features data.
 
@@ -616,7 +648,7 @@ class Model:
         # Establish the device
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         # Extract true target values
-        y_true = samples["AUC"].values
+        y_true = samples[response_metric].values
 
         cl_input = cell_line_features.loc[samples["COSMIC_ID"].values].values
         drug_input = drug_features.loc[samples["DRUG_ID"].values].values
@@ -628,11 +660,12 @@ class Model:
         return predicted, y_true
     
     @staticmethod
-    def per_drug_performance_df(samples, predicted, mean_training_auc=None):
+    def per_drug_performance_df(samples, predicted, mean_training_auc=None,
+                               response_metric="AUC"):
         """Compute evaluation metrics per drug and return them in a DataFrame.
 
         Args:
-            samples (DataFrame): Table containing drug-cell line pairs and corresponding AUC.
+            samples (DataFrame): Table containing drug-cell line pairs and corresponding response metric.
             predicted (torch.Tensor): Model's predictions for considered samples.
             mean_training_auc (float): Mean of drug-response in training data for calculating dummy values,
                 defaults to None. If None, mean of true AUC for a given drug is considered, resulting in
@@ -642,7 +675,7 @@ class Model:
             performance_per_drug (DataFrame): Table containing per-drug model and dummy performance metrics.
         """
         sample_with_predictions = samples.copy()
-        sample_with_predictions["Predicted AUC"] = predicted.numpy()
+        sample_with_predictions["Predicted " + str(response_metric)] = predicted.numpy()
 
         drugs = []
         model_corrs = []
@@ -658,13 +691,13 @@ class Model:
             if mean_training_auc:
                 dummy_preds = [mean_training_auc] * df.shape[0]
             else:
-                dummy_preds = [df["AUC"].mean()] * df.shape[0]
-            dummy_rmse = metrics.mean_squared_error(df["AUC"], dummy_preds) ** 0.5
-            dummy_corr = pearsonr(df["AUC"], dummy_preds)
+                dummy_preds = [df[response_metric].mean()] * df.shape[0]
+            dummy_rmse = metrics.mean_squared_error(df[response_metric], dummy_preds) ** 0.5
+            dummy_corr = pearsonr(df[response_metric], dummy_preds)
 
             try:
-                model_rmse = metrics.mean_squared_error(df["AUC"], df["Predicted AUC"]) ** 0.5
-                model_corr = pearsonr(df["AUC"], df["Predicted AUC"])
+                model_rmse = metrics.mean_squared_error(df[response_metric], df["Predicted " + str(response_metric)]) ** 0.5
+                model_corr = pearsonr(df[response_metric], df["Predicted " + str(response_metric)])
             except ValueError:
                 model_rmse, model_corr = np.nan, (np.nan, np.nan)
 
@@ -689,11 +722,12 @@ class Model:
         return performance_per_drug
     
     @staticmethod
-    def per_entity_performance_df(samples, predicted, entity_type="DRUG_ID", mean_training_auc=None):
+    def per_entity_performance_df(samples, predicted, entity_type="DRUG_ID", mean_training_auc=None,
+                                 response_metric="AUC"):
         """Compute evaluation metrics per entity (drug or cell line) and return them in a DataFrame.
 
         Args:
-            samples (DataFrame): Table containing drug-cell line pairs and corresponding AUC.
+            samples (DataFrame): Table containing drug-cell line pairs and corresponding response metric.
             predicted (torch.Tensor): Model's predictions for considered samples.
             mean_training_auc (float): Mean of drug-response in training data for calculating dummy values,
                 defaults to None. If None, mean of true AUC for a given drug is considered, resulting in
@@ -703,7 +737,7 @@ class Model:
             performance_per_entity (DataFrame): Table containing per-entity model and dummy performance metrics.
         """
         sample_with_predictions = samples.copy()
-        sample_with_predictions["Predicted AUC"] = predicted.numpy()
+        sample_with_predictions["Predicted " + str(response_metric)] = predicted.numpy()
 
         entities = []
         model_corrs = []
@@ -719,13 +753,13 @@ class Model:
             if mean_training_auc:
                 dummy_preds = [mean_training_auc] * df.shape[0]
             else:
-                dummy_preds = [df["AUC"].mean()] * df.shape[0]
-            dummy_rmse = metrics.mean_squared_error(df["AUC"], dummy_preds) ** 0.5
-            dummy_corr = pearsonr(df["AUC"], dummy_preds)
+                dummy_preds = [df[response_metric].mean()] * df.shape[0]
+            dummy_rmse = metrics.mean_squared_error(df[response_metric], dummy_preds) ** 0.5
+            dummy_corr = pearsonr(df[response_metric], dummy_preds)
 
             try:
-                model_rmse = metrics.mean_squared_error(df["AUC"], df["Predicted AUC"]) ** 0.5
-                model_corr = pearsonr(df["AUC"], df["Predicted AUC"])
+                model_rmse = metrics.mean_squared_error(df[response_metric], df["Predicted " + str(response_metric)]) ** 0.5
+                model_corr = pearsonr(df[response_metric], df["Predicted " + str(response_metric)])
             except ValueError:
                 model_rmse, model_corr = np.nan, (np.nan, np.nan)
 
@@ -766,14 +800,14 @@ class ModelWithAutoencoders(Model):
     """
     def train(self, train_samples, cell_line_features, drug_features,
              batch_size, optimizer, criterion, reconstruction_term_drug=0.0,
-              reconstruction_term_cl=0.0, reg_lambda=0.0, log=True):
+              reconstruction_term_cl=0.0, reg_lambda=0.0, log=True, response_metric="AUC"):
         """Perform one epoch of training of the underlying network with autoencoders.
 
         Rather than only drug-reponse prediction losss, also optimize for difference in drug and cell line
         input data and their corresponding reconstructions.
 
         Args:
-            train_samples (DataFrame): Table containing drug-cell line training pairs and corresponding AUC.
+            train_samples (DataFrame): Table containing drug-cell line training pairs and corresponding response metric.
             cell_line_features (DataFrame): Cell line features data.
             drug_features (DataFrame): Drug features data.
             batch_size (int): Batch size.
@@ -809,7 +843,7 @@ class ModelWithAutoencoders(Model):
                 samples_batch = train_samples.iloc[batch * batch_size:]
 
             # Extract output variable batch
-            y_batch = torch.from_numpy(samples_batch["AUC"].values).view(-1, 1).to(device)
+            y_batch = torch.from_numpy(samples_batch[response_metric].values).view(-1, 1).to(device)
 
             # Extract cell lines IDs for which data shall be extracted
             cl_ids = samples_batch["COSMIC_ID"].values
@@ -851,14 +885,14 @@ class ModelWithAutoencoders(Model):
     
     def train_with_independence_penalty(self, train_samples, cell_line_features, drug_features,
              batch_size, optimizer, criterion, reconstruction_term_drug=0.0,
-              reconstruction_term_cl=0.0, independence_term_drug=0.0, independence_term_cl=0.0, reg_lambda=0.0, log=True):
+              reconstruction_term_cl=0.0, independence_term_drug=0.0, independence_term_cl=0.0, reg_lambda=0.0, log=True, response_metric="AUC"):
         """Perform one epoch of training of the underlying network with autoencoders.
 
         Rather than only drug-reponse prediction losss, also optimize for difference in drug and cell line
         input data and their corresponding reconstructions.
 
         Args:
-            train_samples (DataFrame): Table containing drug-cell line training pairs and corresponding AUC.
+            train_samples (DataFrame): Table containing drug-cell line training pairs and corresponding response metric.
             cell_line_features (DataFrame): Cell line features data.
             drug_features (DataFrame): Drug features data.
             batch_size (int): Batch size.
@@ -894,7 +928,7 @@ class ModelWithAutoencoders(Model):
                 samples_batch = train_samples.iloc[batch * batch_size:]
 
             # Extract output variable batch
-            y_batch = torch.from_numpy(samples_batch["AUC"].values).view(-1, 1).to(device)
+            y_batch = torch.from_numpy(samples_batch[response_metric].values).view(-1, 1).to(device)
 
             # Extract cell lines IDs for which data shall be extracted
             cl_ids = samples_batch["COSMIC_ID"].values
@@ -952,11 +986,11 @@ class ModelWithAutoencoders(Model):
             
         return loss, drug_recounstruction_loss, cl_reconstruction_loss, drug_independence_loss, cl_independence_loss
     
-    def predict(self, samples, cell_line_features, drug_features):
+    def predict(self, samples, cell_line_features, drug_features, response_metric="AUC"):
         """Predict response along with drug anc cell line reconstructions for a given set of samples.
 
         Args:
-            samples (DataFrame): Table containing drug-cell line pairs and corresponding AUC.
+            samples (DataFrame): Table containing drug-cell line pairs and corresponding response metric.
             cell_line_features (DataFrame): Cell line features data.
             drug_features (DataFrame): Drug features data.
 
@@ -970,7 +1004,7 @@ class ModelWithAutoencoders(Model):
         # Establish the device
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        y_true = samples["AUC"].values
+        y_true = samples[response_metric].values
 
         cl_input = cell_line_features.loc[samples["COSMIC_ID"].values].values
         drug_input = drug_features.loc[samples["DRUG_ID"].values].values
